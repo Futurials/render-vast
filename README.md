@@ -35,7 +35,7 @@ La GPU para WebGL necesita que el contenedor arranque con `NVIDIA_DRIVER_CAPABIL
 
 | tag | digest |
 |---|---|
-| `hf0.8.140-chrome152.0.7977.30-node24.21.0` | pendiente del primer build |
+| `hf0.8.140-chrome152.0.7977.30-node24.21.0` | `sha256:4e1a7ecc11a82982acf6d9dab71184ddb96ae9d6e80ab35d5d820728a5498515` (575 MiB comprimidos) |
 
 Usala siempre por digest (`ghcr.io/futurials/render-vast@sha256:…`), no por tag: el tag se reescribe si se reconstruye.
 
