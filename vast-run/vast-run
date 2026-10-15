@@ -29,8 +29,8 @@ ESTADO="${XDG_STATE_HOME:-$HOME/.local/state}/vast-run"
 # de WebGL. El pedido puede forzar otra con "imagen".
 # hf0.8.140-chrome152.0.7977.30-node24.21.0 (CUDA, ffmpeg 6.1.1 con NVENC, Node, Python 3 + Pillow, Chrome)
 IMAGEN_GPU="ghcr.io/futurials/render-vast@sha256:4e1a7ecc11a82982acf6d9dab71184ddb96ae9d6e80ab35d5d820728a5498515"
-# cpu-ffmpeg6.1.1-node24.22.0 (Ubuntu 24.04, ffmpeg 6.1.1 con libx264, Node, Python 3 + Pillow)
-IMAGEN_CPU="ghcr.io/futurials/render-vast@sha256:DIGEST_CPU_PENDIENTE"
+# cpu-ffmpeg6.1.1-node24.22.0-bf9f57af797b (Ubuntu 24.04, ffmpeg 6.1.1 con libx264, Node, Python 3 + Pillow)
+IMAGEN_CPU="ghcr.io/futurials/render-vast@sha256:4c651b3c3cff68c66d03b65744857d6f57be8749781426f8b84f9c8fdfedab9e"
 MAX_DPH=0.35; MAX_MAQUINAS=2; MIN_REL=0.98; MAX_INET=0.05; MIN_CUDA=12.4; RESPALDO_MIN=5
 PREFIJO=vast-run
 

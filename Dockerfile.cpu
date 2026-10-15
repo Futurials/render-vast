@@ -23,11 +23,24 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 # la máquina con curl y vast-run lo busca con pgrep; la subida y la bajada son tar comprimido por SSH).
 # El ffmpeg de apt arrastra el driver OpenGL de Mesa (libgl1-mesa-dri → mesa-libgallium → libllvm20: 220 MB de 560) por
 # libavdevice. ffmpeg no lo enlaza (lo carga sólo quien abre un contexto GL) y en una máquina sin pantalla no se usa: se
-# saca a la fuerza y el build comprueba que ffmpeg y las libav no quedan con bibliotecas faltantes y que codifican.
+# reemplaza libgl1-mesa-dri y mesa-libgallium por paquetes vacíos de la misma versión (así apt queda consistente: Vast
+# corre apt-get encima de la imagen al arrancar, para instalar su SSH, y con dependencias rotas esa capa falla) y se
+# saca libllvm20, que sólo usaba mesa-libgallium. El build comprueba apt, que ffmpeg y las libav no quedan con
+# bibliotecas faltantes y que codifican.
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends ca-certificates curl xz-utils procps time ffmpeg python3 python3-pil \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
- && dpkg --purge --force-depends libgl1-mesa-dri mesa-libgallium libllvm20 \
+ && for p in libgl1-mesa-dri mesa-libgallium; do \
+      d="/tmp/vacio-${p}" && mkdir -p "${d}/DEBIAN" \
+      && printf 'Package: %s\nVersion: %s\nArchitecture: amd64\nMaintainer: render-vast\nDescription: %s\n' \
+           "${p}" "$(dpkg-query -Wf '${Version}' "${p}")" "vacio: Mesa no se usa en esta imagen sin pantalla" \
+           > "${d}/DEBIAN/control" \
+      && dpkg-deb -b "${d}" "${d}.deb" > /dev/null; \
+    done \
+ && dpkg --purge --force-depends libgl1-mesa-dri mesa-libgallium \
+ && dpkg -i /tmp/vacio-libgl1-mesa-dri.deb /tmp/vacio-mesa-libgallium.deb \
+ && dpkg --purge libllvm20 && rm -rf /tmp/vacio-* \
+ && apt-get check \
  && missing="$(ldd /usr/bin/ffmpeg /usr/bin/ffprobe /usr/lib/x86_64-linux-gnu/libav*.so.* | grep 'not found' || true)" \
  && [ -z "${missing}" ] \
  && v="$(ffmpeg -version | sed -n 1p)" && echo "${v}" && [[ "${v}" == "ffmpeg version ${FFMPEG_VERSION}-"* ]] \

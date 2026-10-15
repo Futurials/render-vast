@@ -8,14 +8,24 @@ que la preparación baje de varios minutos a lo que tarda en bajar la imagen.
 ghcr.io/futurials/render-vast
 ```
 
+El mismo paquete tiene dos imágenes, con tags separados:
+
+| imagen | para qué | Dockerfile | comprimida |
+|---|---|---|---|
+| WebGL (tags `hf…-chrome…-node…`) | render de HyperFrames con GPU (motion, `launch-video`) y trabajos de `vast-run` con GPU | [`Dockerfile`](Dockerfile) | 575 MiB |
+| CPU (tags `cpu-…`) | trabajos de `vast-run` sin GPU: codificar video con libx264, procesar lotes | [`Dockerfile.cpu`](Dockerfile.cpu) | 197 MiB |
+
+La de CPU existe porque el arranque de la máquina se comía la ganancia de codificar en Vast: la de WebGL baja CUDA,
+Chrome y HyperFrames que un trabajo de ffmpeg no usa (MOT-019: 131 s de arranque en CPU, 409 s en GPU).
+
 ## Despachar otros trabajos pesados: `vast-run/`
 
-[`vast-run/`](vast-run/README.md) usa esta misma imagen para correr cualquier trabajo pesado (codificar video, renderizar,
+[`vast-run/`](vast-run/README.md) usa estas imágenes (la de CPU con `perfil.gpu: "no"`, la de WebGL con GPU) para correr cualquier trabajo pesado (codificar video, renderizar,
 procesar lotes) en una máquina de Vast.ai en vez de en el VPS: sube una carpeta con su `trabajo.json`, corre el comando,
 baja las salidas, deja un `informe.json` con tiempos y costo, y destruye la máquina siempre. Sólo acepta datos sintéticos
 o públicos.
 
-## Qué trae
+## Qué trae la imagen de WebGL
 
 | componente | versión | cómo se verifica en el build |
 |---|---|---|
@@ -38,15 +48,41 @@ La imagen no trae composiciones, código de skills, assets ni secretos. Eso se s
 La GPU para WebGL necesita que el contenedor arranque con `NVIDIA_DRIVER_CAPABILITIES=all` (la base sólo pide
 `compute,utility`, y sin `graphics` no aparecen las bibliotecas EGL de NVIDIA).
 
+## Qué trae la imagen de CPU
+
+| componente | versión | cómo se verifica en el build |
+|---|---|---|
+| base | `ubuntu:24.04` (sin CUDA), la misma distribución que el VPS | fijada por digest `sha256:534baea6…eb55` |
+| paquetes del sistema | `ffmpeg` 6.1.1 de apt (con libx264; el mismo que el VPS, así un video armado en Vast sale igual), `python3` + `python3-pil` 10.2.0, `curl`, `procps`, `tar`, `time` | el build exige ffmpeg 6.1.1, el codificador libx264 y una codificación de prueba (libx264 + AAC + `loudnorm`) |
+| Node.js | v24.22.0 (LTS), tarball oficial en `/opt/node-v24.22.0-linux-x64`, enlazado en `/usr/local/bin` | SHA-256 del tarball |
+
+No trae CUDA, HyperFrames, Chrome ni bibliotecas gráficas. El ffmpeg de apt arrastra el driver OpenGL de Mesa
+(`libgl1-mesa-dri`, `mesa-libgallium`, `libllvm20`: 220 MB de 560) como dependencia de `libavdevice`; ffmpeg no lo
+enlaza y en una máquina sin pantalla no se usa, así que el build lo saca con `dpkg --force-depends` y comprueba con `ldd`
+que ni ffmpeg ni las libav quedan con bibliotecas faltantes. Sin eso la imagen pesaba 250 MiB comprimida. Como queda un
+paquete con dependencias rotas a propósito, no hay que correr `apt-get install` encima de esta imagen.
+
 ## Versión vigente
 
-| tag | digest |
-|---|---|
-| `hf0.8.140-chrome152.0.7977.30-node24.21.0` | `sha256:4e1a7ecc11a82982acf6d9dab71184ddb96ae9d6e80ab35d5d820728a5498515` (575 MiB comprimidos) |
+| imagen | tag | digest |
+|---|---|---|
+| WebGL | `hf0.8.140-chrome152.0.7977.30-node24.21.0` | `sha256:4e1a7ecc11a82982acf6d9dab71184ddb96ae9d6e80ab35d5d820728a5498515` (575 MiB comprimidos) |
+| CPU | `cpu-ffmpeg6.1.1-node24.22.0-bf9f57af797b` | `sha256:4c651b3c3cff68c66d03b65744857d6f57be8749781426f8b84f9c8fdfedab9e` (197 MiB comprimidos) |
 
 Usala siempre por digest (`ghcr.io/futurials/render-vast@sha256:…`), no por tag: el tag se reescribe si se reconstruye.
 
 ## Cómo se reconstruye
+
+### La imagen de CPU
+
+El workflow [`build-image-cpu.yml`](.github/workflows/build-image-cpu.yml) corre en cada PR y cada push a `main` que
+toquen `Dockerfile.cpu` o el workflow, y a mano. El tag lleva las versiones y los primeros 12 caracteres del SHA-256 del
+`Dockerfile.cpu`: si ese tag ya existe no reconstruye, así que cada `Dockerfile.cpu` se publica una sola vez, en el PR
+que lo cambia, y el digest que ese PR fija en `vast-run` es el que queda (una reconstrucción daría otro digest). Para
+cambiar una versión: editá el `ARG` (con su SHA-256), `VERSIONES` en el workflow, y después de la corrida del PR el
+digest en `vast-run/vast-run` y en la tabla de arriba. La imagen de WebGL no se toca.
+
+### La imagen de WebGL
 
 El workflow [`build-image.yml`](.github/workflows/build-image.yml) construye y publica la imagen en GHCR con el
 `GITHUB_TOKEN` del repositorio. Corre solo con cada push a `main` que toque el `Dockerfile` o el workflow, y a mano desde
@@ -63,4 +99,5 @@ Para probar el build en local, sin publicar:
 
 ```bash
 docker buildx build --load -t render-vast:local .
+docker buildx build --load -f Dockerfile.cpu -t render-vast-cpu:local .
 ```
