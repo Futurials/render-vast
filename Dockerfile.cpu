@@ -1,0 +1,61 @@
+# render-vast, variante CPU · imagen liviana para los trabajos de vast-run que no usan la GPU (codificar video con
+# libx264, procesar lotes). Sin CUDA, sin HyperFrames y sin Chrome: sólo lo que esos trabajos y vast-run necesitan en la
+# máquina. Se publica como tag aparte del mismo paquete (ghcr.io/futurials/render-vast:cpu-…); ver build-image-cpu.yml.
+# Cada descarga se verifica por SHA-256 y el build falla si algo no coincide.
+
+# Ubuntu 24.04, fijada por digest del índice multiplataforma. Es la misma distribución que el VPS: el ffmpeg de apt es el
+# mismo 6.1.1 con el que se arma allá, así que un video armado acá sale igual al armado en el VPS.
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+
+ARG NODE_VERSION=v24.22.0
+ARG NODE_SHA256=cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008
+ARG FFMPEG_VERSION=6.1.1
+
+LABEL org.opencontainers.image.source="https://github.com/Futurials/render-vast" \
+      org.opencontainers.image.description="Ubuntu 24.04 + ffmpeg (libx264), Node y Python 3 con Pillow para trabajos por CPU en Vast.ai" \
+      org.opencontainers.image.licenses="NOASSERTION"
+
+ENV DEBIAN_FRONTEND=noninteractive CI=true NO_COLOR=1 TERM=dumb npm_config_progress=false DO_NOT_TRACK=1
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+# paquetes del sistema: ffmpeg y Python con Pillow para el trabajo; curl, procps y tar para vast-run (el guardián borra
+# la máquina con curl y vast-run lo busca con pgrep; la subida y la bajada son tar comprimido por SSH).
+# El ffmpeg de apt arrastra el driver OpenGL de Mesa (libgl1-mesa-dri → mesa-libgallium → libllvm20: 220 MB de 560) por
+# libavdevice. ffmpeg no lo enlaza (lo carga sólo quien abre un contexto GL) y en una máquina sin pantalla no se usa: se
+# reemplaza libgl1-mesa-dri y mesa-libgallium por paquetes vacíos de la misma versión (así apt queda consistente: Vast
+# corre apt-get encima de la imagen al arrancar, para instalar su SSH, y con dependencias rotas esa capa falla) y se
+# saca libllvm20, que sólo usaba mesa-libgallium. El build comprueba apt, que ffmpeg y las libav no quedan con
+# bibliotecas faltantes y que codifican.
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends ca-certificates curl xz-utils procps time ffmpeg python3 python3-pil \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
+ && for p in libgl1-mesa-dri mesa-libgallium; do \
+      d="/tmp/vacio-${p}" && mkdir -p "${d}/DEBIAN" \
+      && printf 'Package: %s\nVersion: %s\nArchitecture: amd64\nMaintainer: render-vast\nDescription: %s\n' \
+           "${p}" "$(dpkg-query -Wf '${Version}' "${p}")" "vacio: Mesa no se usa en esta imagen sin pantalla" \
+           > "${d}/DEBIAN/control" \
+      && dpkg-deb -b "${d}" "${d}.deb" > /dev/null; \
+    done \
+ && dpkg --purge --force-depends libgl1-mesa-dri mesa-libgallium \
+ && dpkg -i /tmp/vacio-libgl1-mesa-dri.deb /tmp/vacio-mesa-libgallium.deb \
+ && dpkg --purge libllvm20 && rm -rf /tmp/vacio-* \
+ && apt-get check \
+ && missing="$(ldd /usr/bin/ffmpeg /usr/bin/ffprobe /usr/lib/x86_64-linux-gnu/libav*.so.* | grep 'not found' || true)" \
+ && [ -z "${missing}" ] \
+ && v="$(ffmpeg -version | sed -n 1p)" && echo "${v}" && [[ "${v}" == "ffmpeg version ${FFMPEG_VERSION}-"* ]] \
+ && e="$(ffmpeg -hide_banner -encoders)" && [[ "${e}" == *" libx264 "* ]] \
+ && ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=s=320x180:r=25:d=1 -f lavfi -i sine=d=1 \
+      -af loudnorm -c:v libx264 -preset veryfast -crf 20 -c:a aac -shortest -f mp4 /dev/null \
+ && python3 -c 'import PIL; print("pillow", PIL.__version__)' && tar --version | sed -n 1p && curl --version | sed -n 1p
+
+# Node, tarball oficial; sólo el binario y npm (sin headers ni documentación)
+RUN cd /opt \
+ && curl -fsS -o node.tar.xz "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz" \
+ && echo "${NODE_SHA256}  node.tar.xz" | sha256sum -c - \
+ && tar xf node.tar.xz && rm node.tar.xz \
+ && rm -rf "/opt/node-${NODE_VERSION}-linux-x64/include" "/opt/node-${NODE_VERSION}-linux-x64/share" \
+ && ln -sf "/opt/node-${NODE_VERSION}-linux-x64/bin/"* /usr/local/bin/ \
+ && [ "$(node -v)" = "${NODE_VERSION}" ] && npm -v
+
+WORKDIR /root

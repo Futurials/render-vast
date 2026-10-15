@@ -1,8 +1,18 @@
 # vast-run
 
 Despachador genérico de trabajos pesados (codificar video, renderizar, procesar lotes) a una máquina alquilada de
-Vast.ai. Sube una carpeta, corre un comando parado en ella, baja las salidas y destruye la máquina. Usa la imagen de este
-repo, fijada por digest: ffmpeg 6.1.1 (con `h264_nvenc`), Node 24, Python 3 con Pillow y Chrome Headless Shell.
+Vast.ai. Sube una carpeta, corre un comando parado en ella, baja las salidas y destruye la máquina. Usa una de las dos
+imágenes de este repo, siempre fijada por digest:
+
+| `perfil.gpu` | imagen | qué trae | arranque medido |
+|---|---|---|---|
+| `"no"` | CPU, `ghcr.io/futurials/render-vast@sha256:7736e548…6a91` (197 MiB) | Ubuntu 24.04, ffmpeg 6.1.1 (libx264), Node 24, Python 3 con Pillow | 96 a 98 s en frío; 30 s si la máquina ya la tiene (MOT-020) |
+| `"cualquiera"` o `"requerida"` | WebGL, `ghcr.io/futurials/render-vast@sha256:4e1a7ecc…8515` (575 MiB) | CUDA, ffmpeg 6.1.1 (con `h264_nvenc`), Node 24, Python 3 con Pillow, HyperFrames y Chrome Headless Shell | 409 s con GPU, 131 s sin GPU (MOT-019) |
+
+Un trabajo que necesita algo que sólo trae la de WebGL (Chrome, HyperFrames) sin GPU la pide con `"imagen"`.
+
+Del arranque en frío de la de CPU, unos 60 s no son la imagen: Vast arma una capa encima que instala su SSH con
+`apt-get` (por eso la imagen deja apt consistente; ver el README de la raíz).
 
 ```bash
 vast-run/vast-run <carpeta>                 # corre el trabajo
@@ -43,9 +53,10 @@ Va dentro de la carpeta del trabajo.
 | `tope_usd` | gasto máximo de la corrida, hasta USD 1,00 (por defecto 0,30). |
 | `ttl_min` | minutos de vida máxima de la máquina desde que se pide, entre 5 y 180 (por defecto 30). |
 | `excluir_subida` | rutas de la carpeta que no se suben (salidas viejas, por ejemplo). |
+| `imagen` | opcional: fuerza una imagen, fijada por digest (`registro/nombre@sha256:<64 hex>`); si no, va la de CPU con `gpu: "no"` y la de WebGL con GPU. |
 
 La máquina se elige entre las ofertas verificadas de Vast con confiabilidad ≥ 0,98, tráfico ≤ USD 0,05/GB, puerto
-directo y CUDA ≥ 12.4 en el driver: la más barata que cumple el perfil, y a igual precio la de más núcleos. Se prueban
+directo y, salvo con la imagen de CPU (que no trae CUDA), CUDA ≥ 12.4 en el driver: la más barata que cumple el perfil, y a igual precio la de más núcleos. Se prueban
 hasta tres en orden, porque una oferta puede desaparecer entre la búsqueda y el alta.
 
 ## Regla de datos

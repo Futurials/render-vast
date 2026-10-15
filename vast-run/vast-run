@@ -25,8 +25,12 @@ YO="$(readlink -f "$0")"
 VK="${VAST_RUN_VK:-$HOME/Repos/apps/motion-skills/render/vk}"
 SSH_KEY="${VAST_RUN_SSH_KEY:-$HOME/.ssh/id_ed25519_vast}"
 ESTADO="${XDG_STATE_HOME:-$HOME/.local/state}/vast-run"
-# hf0.8.140-chrome152.0.7977.30-node24.21.0 (ffmpeg 6.1.1, Node, Python 3 + Pillow, Chrome); siempre por digest
-IMAGEN="ghcr.io/futurials/render-vast@sha256:4e1a7ecc11a82982acf6d9dab71184ddb96ae9d6e80ab35d5d820728a5498515"
+# Las imágenes, siempre por digest. Con perfil.gpu "no" va la de CPU (sin CUDA ni Chrome: arranca mucho antes); con GPU, la
+# de WebGL. El pedido puede forzar otra con "imagen".
+# hf0.8.140-chrome152.0.7977.30-node24.21.0 (CUDA, ffmpeg 6.1.1 con NVENC, Node, Python 3 + Pillow, Chrome)
+IMAGEN_GPU="ghcr.io/futurials/render-vast@sha256:4e1a7ecc11a82982acf6d9dab71184ddb96ae9d6e80ab35d5d820728a5498515"
+# cpu-ffmpeg6.1.1-node24.22.0-a9428aab0060 (Ubuntu 24.04, ffmpeg 6.1.1 con libx264, Node, Python 3 + Pillow)
+IMAGEN_CPU="ghcr.io/futurials/render-vast@sha256:7736e548eb1269336bf8e5d43c109654fb8b995bbebefb570baf8b53041f6a91"
 MAX_DPH=0.35; MAX_MAQUINAS=2; MIN_REL=0.98; MAX_INET=0.05; MIN_CUDA=12.4; RESPALDO_MIN=5
 PREFIJO=vast-run
 
@@ -67,7 +71,7 @@ CARPETA="$(cd "$CARPETA" && pwd)"
 # ── el pedido: se valida entero antes de tocar la clave o Vast ───────────────────────────────────────────────────────
 ETQ="$PREFIJO-$(date +%Y%m%d-%H%M%S)-$$"; LOGD="$ESTADO/$ETQ"; mkdir -p "$LOGD"
 VARS="$(python3 -I - "$CARPETA/trabajo.json" "$LOGD/comando.sh" <<'EOF'
-import json, shlex, sys
+import json, re, shlex, sys
 def no(msg): print("PEDIDO RECHAZADO: " + msg, file=sys.stderr); sys.exit(3)
 try: p = json.load(open(sys.argv[1]))
 except Exception as e: no("trabajo.json no es JSON válido: %s" % e)
@@ -93,19 +97,24 @@ if not (isinstance(ttl, int) and 5 <= ttl <= 180): no("ttl_min tiene que ser un 
 disco = pf.get("disco_gb", 20)
 exmaq = pf.get("excluir_maquinas", [])
 if not (isinstance(exmaq, list) and all(isinstance(x, int) for x in exmaq)): no("perfil.excluir_maquinas tiene que ser una lista de machine_id")
+img = p.get("imagen", "")
+if img and not (isinstance(img, str) and re.fullmatch(r"[a-z0-9./_-]+@sha256:[0-9a-f]{64}", img)):
+    no('"imagen" tiene que ir fijada por digest: registro/nombre@sha256:<64 hex>')
 open(sys.argv[2], "w").write("#!/usr/bin/env bash\nset -euo pipefail\n" + c + "\n")
 for k, v in dict(CPU=cpu, RAM=ram, GPU=gpu, MODELOS=" ".join(m.replace(" ", "_") for m in modelos), TOPE=tope,
-                 TTL=ttl, DISCO=disco, EXMAQ=" ".join(map(str, exmaq)), DATOS=p["datos"], SALIDAS="\n".join(s),
+                 TTL=ttl, DISCO=disco, EXMAQ=" ".join(map(str, exmaq)), DATOS=p["datos"], IMAGEN_PEDIDA=img, SALIDAS="\n".join(s),
                  EXCLUIR="\n".join(p.get("excluir_subida", []))).items():
     print("%s=%s" % (k, shlex.quote(str(v))))
 EOF
 )" || { rm -rf "$LOGD"; exit 3; }
 eval "$VARS"
+if [ -n "$IMAGEN_PEDIDA" ]; then IMAGEN="$IMAGEN_PEDIDA"; elif [ "$GPU" = no ]; then IMAGEN="$IMAGEN_CPU"; else IMAGEN="$IMAGEN_GPU"; fi
 LOG="$LOGD/corrida.log"; TIEMPOS="$LOGD/tiempos.tsv"
 exec > >(tee -a "$LOG") 2>&1
 marca() { printf '%s\t%s\n' "$1" "$(date +%s.%N)" >> "$TIEMPOS"; echo "[$(ts)] $1"; }
 credito() { "$VK" show user --raw < /dev/null 2>/dev/null | py 'import json,sys; print(json.load(sys.stdin)["credit"])'; }
 echo "== vast-run $ETQ · $CARPETA · datos $DATOS · cpu>=$CPU ram>=${RAM}GB gpu=$GPU · tope USD $TOPE · ttl $TTL min"
+echo "imagen $IMAGEN"
 marca inicio
 
 # ── ranura: como máximo MAX_MAQUINAS corridas a la vez desde este host ───────────────────────────────────────────────
@@ -130,7 +139,9 @@ import json,sys; print(sum(1 for i in json.load(sys.stdin) if (i.get("label") or
 # ── oferta ───────────────────────────────────────────────────────────────────────────────────────────────────────────
 marca busqueda_inicio
 Q="verified=true rentable=true num_gpus=1 reliability>=$MIN_REL cpu_cores_effective>=$CPU cpu_ram>=$RAM"
-Q="$Q dph_total<=$MAX_DPH inet_up_cost<=$MAX_INET inet_down_cost<=$MAX_INET disk_space>=$DISCO cuda_max_good>=$MIN_CUDA"
+Q="$Q dph_total<=$MAX_DPH inet_up_cost<=$MAX_INET inet_down_cost<=$MAX_INET disk_space>=$DISCO"
+# la imagen de CPU no trae CUDA: el driver de la máquina no importa
+[ "$IMAGEN" = "$IMAGEN_CPU" ] || Q="$Q cuda_max_good>=$MIN_CUDA"
 Q="$Q direct_port_count>=1 inet_down>=200 inet_up>=100"
 [ "$GPU" = requerida ] && Q="$Q gpu_name in [${MODELOS// /,}]"
 "$VK" search offers "$Q" -o dph_total --raw --limit 200 < /dev/null 2>/dev/null > "$LOGD/ofertas.json"
@@ -183,7 +194,7 @@ def fase(a, b): return round(t[b] - t[a], 1) if a in t and b in t else None
 dph = float("${DPH:-0}" or 0)
 vida = fase("alta", "baja")
 inf = {
-  "etiqueta": "$ETQ", "estado": "$ESTADO_FIN", "rc": $rc, "rc_comando": ${RC_CMD:-None}, "datos": "$DATOS",
+  "etiqueta": "$ETQ", "estado": "$ESTADO_FIN", "rc": $rc, "rc_comando": ${RC_CMD:-None}, "datos": "$DATOS", "imagen": "$IMAGEN",
   "oferta": json.loads(r'''$OFERTA_JSON'''), "instancia": "${IID}" or None,
   "fases_s": {"busqueda": fase("busqueda_inicio", "busqueda_fin"), "arranque": fase("alta_pedida", "ssh_ok"),
               "guardian": fase("ssh_ok", "guardian_ok"), "subida": fase("subida_inicio", "subida_fin"),
