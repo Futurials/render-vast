@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# vast-run <carpeta> — corre un trabajo pesado (video, render, lotes) en una máquina alquilada de Vast.ai y la destruye.
+#
+#   vast-run <carpeta> [--max-dph 0.35] [--solo-buscar]
+#   vast-run --destruir <etiqueta>      (lo usan los temporizadores; destruye toda máquina con esa etiqueta)
+#
+# La carpeta trae un trabajo.json (ver README.md): qué comando correr, qué bajar, qué máquina hace falta, qué datos
+# lleva, cuánto puede gastar y cuántos minutos puede vivir la máquina. Se sube entera (tar comprimido por SSH), el
+# comando corre parado en ella, se bajan las salidas y se deja un informe.json en la carpeta.
+#
+# Garantías:
+#   · Candado de datos: si "datos" no es "sinteticos" ni "publicos", se rechaza antes de leer la clave o alquilar nada.
+#     No hay bandera para saltearlo.
+#   · Gasto: el peor caso de la corrida (precio por hora × vida máxima de la máquina) tiene que entrar en tope_usd.
+#     El crédito se lee antes y después.
+#   · La máquina se destruye siempre: al terminar, al fallar y por señal (trampa de salida). Además, sin depender de
+#     este proceso: un temporizador de systemd en este host y, dentro de la máquina, un guardián arrancado por onstart
+#     que la destruye sola a los ttl_min con la clave por instancia que Vast le inyecta (CONTAINER_API_KEY). Si ese
+#     guardián no está armado, la corrida se corta antes de subir nada.
+#   · Como máximo 2 máquinas a la vez por despachador (ranuras con flock, más un recuento en Vast).
+#   · La clave de Vast se lee de Bitwarden en cada llamada (vk) y nunca se escribe.
+set -euo pipefail
+
+YO="$(readlink -f "$0")"
+VK="${VAST_RUN_VK:-$HOME/Repos/apps/motion-skills/render/vk}"
+SSH_KEY="${VAST_RUN_SSH_KEY:-$HOME/.ssh/id_ed25519_vast}"
+ESTADO="${XDG_STATE_HOME:-$HOME/.local/state}/vast-run"
+# hf0.8.140-chrome152.0.7977.30-node24.21.0 (ffmpeg 6.1.1, Node, Python 3 + Pillow, Chrome); siempre por digest
+IMAGEN="ghcr.io/futurials/render-vast@sha256:4e1a7ecc11a82982acf6d9dab71184ddb96ae9d6e80ab35d5d820728a5498515"
+MAX_DPH=0.35; MAX_MAQUINAS=2; MIN_REL=0.98; MAX_INET=0.05; MIN_CUDA=12.4; RESPALDO_MIN=5
+PREFIJO=vast-run
+
+py() { python3 -I -c "$@"; }
+ts() { date '+%F %T %Z'; }
+mkdir -p "$ESTADO"
+
+# ── modo destruir: lo llaman los temporizadores de systemd y la trampa de salida ─────────────────────────────────────
+destruir() {
+  local etq="$1" log="$ESTADO/destruir.log" lista rc
+  for intento in 1 2 3 4 5 6 7 8 9 10; do
+    lista="$("$VK" show instances --raw < /dev/null 2>/dev/null | py '
+import json, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(2)
+for i in d:
+    if (i.get("label") or "") == sys.argv[1]: print(i["id"])' "$etq")"; rc=$?
+    if [ "$rc" -eq 0 ] && [ -z "$lista" ]; then echo "$(date -Is) [$etq] sin máquinas (intento $intento)" >> "$log"; return 0; fi
+    for id in $lista; do
+      echo "$(date -Is) [$etq] destruyendo $id (intento $intento)" >> "$log"
+      "$VK" destroy instance "$id" -y < /dev/null >> "$log" 2>&1 || true
+    done
+    sleep 15
+  done
+  echo "$(date -Is) [$etq] ATENCIÓN: quedaron máquinas tras 10 intentos" >> "$log"; return 1
+}
+if [ "${1:-}" = --destruir ]; then destruir "${2:?uso: vast-run --destruir <etiqueta>}"; exit $?; fi
+
+CARPETA=""; SOLO_BUSCAR=0
+while [ $# -gt 0 ]; do case "$1" in
+  --max-dph) MAX_DPH="$2"; shift 2;; --solo-buscar) SOLO_BUSCAR=1; shift;;
+  -h|--help) sed -n '2,22p' "$YO"; exit 0;;
+  -*) echo "opción desconocida: $1" >&2; exit 2;;
+  *) CARPETA="$1"; shift;; esac; done
+[ -n "$CARPETA" ] && [ -f "$CARPETA/trabajo.json" ] || { echo "uso: vast-run <carpeta con trabajo.json>" >&2; exit 2; }
+CARPETA="$(cd "$CARPETA" && pwd)"
+
+# ── el pedido: se valida entero antes de tocar la clave o Vast ───────────────────────────────────────────────────────
+ETQ="$PREFIJO-$(date +%Y%m%d-%H%M%S)-$$"; LOGD="$ESTADO/$ETQ"; mkdir -p "$LOGD"
+VARS="$(python3 -I - "$CARPETA/trabajo.json" "$LOGD/comando.sh" <<'EOF'
+import json, shlex, sys
+def no(msg): print("PEDIDO RECHAZADO: " + msg, file=sys.stderr); sys.exit(3)
+try: p = json.load(open(sys.argv[1]))
+except Exception as e: no("trabajo.json no es JSON válido: %s" % e)
+# candado de datos: sólo sintéticos o públicos; no hay forma de saltearlo
+if p.get("datos") not in ("sinteticos", "publicos"):
+    no('"datos" tiene que ser "sinteticos" o "publicos" (vino %r): no se despachan datos reales a máquinas de terceros' % p.get("datos"))
+c = p.get("comando")
+if not isinstance(c, str) or not c.strip(): no('falta "comando" (texto)')
+s = p.get("salidas")
+if not isinstance(s, list) or not s or not all(isinstance(x, str) and x for x in s): no('"salidas" tiene que ser una lista de rutas')
+for x in s:
+    if x.startswith("/") or ".." in x.split("/"): no("salida fuera de la carpeta: %r" % x)
+pf = p.get("perfil")
+if not isinstance(pf, dict): no('falta "perfil"')
+cpu, ram, gpu = pf.get("cpu_min", 4), pf.get("ram_min_gb", 8), pf.get("gpu", "no")
+if not (isinstance(cpu, (int, float)) and cpu > 0 and isinstance(ram, (int, float)) and ram > 0): no("cpu_min y ram_min_gb tienen que ser números positivos")
+if gpu not in ("no", "cualquiera", "requerida"): no('perfil.gpu tiene que ser "no", "cualquiera" o "requerida"')
+modelos = pf.get("gpu_modelos", [])
+if gpu == "requerida" and not modelos: no('gpu "requerida" necesita perfil.gpu_modelos, por ejemplo ["RTX 4090"]')
+tope, ttl = p.get("tope_usd", 0.30), p.get("ttl_min", 30)
+if not (isinstance(tope, (int, float)) and 0 < tope <= 1.0): no("tope_usd tiene que estar entre 0 y 1,00")
+if not (isinstance(ttl, int) and 5 <= ttl <= 180): no("ttl_min tiene que ser un entero entre 5 y 180")
+disco = pf.get("disco_gb", 20)
+exmaq = pf.get("excluir_maquinas", [])
+if not (isinstance(exmaq, list) and all(isinstance(x, int) for x in exmaq)): no("perfil.excluir_maquinas tiene que ser una lista de machine_id")
+open(sys.argv[2], "w").write("#!/usr/bin/env bash\nset -euo pipefail\n" + c + "\n")
+for k, v in dict(CPU=cpu, RAM=ram, GPU=gpu, MODELOS=" ".join(m.replace(" ", "_") for m in modelos), TOPE=tope,
+                 TTL=ttl, DISCO=disco, EXMAQ=" ".join(map(str, exmaq)), DATOS=p["datos"], SALIDAS="\n".join(s),
+                 EXCLUIR="\n".join(p.get("excluir_subida", []))).items():
+    print("%s=%s" % (k, shlex.quote(str(v))))
+EOF
+)" || { rm -rf "$LOGD"; exit 3; }
+eval "$VARS"
+LOG="$LOGD/corrida.log"; TIEMPOS="$LOGD/tiempos.tsv"
+exec > >(tee -a "$LOG") 2>&1
+marca() { printf '%s\t%s\n' "$1" "$(date +%s.%N)" >> "$TIEMPOS"; echo "[$(ts)] $1"; }
+credito() { "$VK" show user --raw < /dev/null 2>/dev/null | py 'import json,sys; print(json.load(sys.stdin)["credit"])'; }
+echo "== vast-run $ETQ · $CARPETA · datos $DATOS · cpu>=$CPU ram>=${RAM}GB gpu=$GPU · tope USD $TOPE · ttl $TTL min"
+marca inicio
+
+# ── ranura: como máximo MAX_MAQUINAS corridas a la vez desde este host ───────────────────────────────────────────────
+RANURA=""
+for intento in $(seq 1 60); do
+  for n in $(seq 1 "$MAX_MAQUINAS"); do
+    exec 9> "$ESTADO/ranura-$n.lock"
+    if flock -n 9; then RANURA=$n; break 2; fi
+    exec 9>&-
+  done
+  [ "$intento" = 1 ] && echo "las $MAX_MAQUINAS ranuras están ocupadas; espero (hasta 30 min)"
+  sleep 30
+done
+[ -n "$RANURA" ] || { echo "no se liberó ninguna ranura en 30 minutos"; exit 1; }
+echo "ranura $RANURA de $MAX_MAQUINAS"
+
+C0="$(credito)"; echo "crédito antes USD $C0"
+VIVAS="$("$VK" show instances --raw < /dev/null 2>/dev/null | py '
+import json,sys; print(sum(1 for i in json.load(sys.stdin) if (i.get("label") or "").startswith(sys.argv[1])))' "$PREFIJO-")"
+[ "$VIVAS" -lt "$MAX_MAQUINAS" ] || { echo "ya hay $VIVAS máquinas de vast-run vivas en Vast: no alquilo otra"; exit 1; }
+
+# ── oferta ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+marca busqueda_inicio
+Q="verified=true rentable=true num_gpus=1 reliability>=$MIN_REL cpu_cores_effective>=$CPU cpu_ram>=$RAM"
+Q="$Q dph_total<=$MAX_DPH inet_up_cost<=$MAX_INET inet_down_cost<=$MAX_INET disk_space>=$DISCO cuda_max_good>=$MIN_CUDA"
+Q="$Q direct_port_count>=1 inet_down>=200 inet_up>=100"
+[ "$GPU" = requerida ] && Q="$Q gpu_name in [${MODELOS// /,}]"
+"$VK" search offers "$Q" -o dph_total --raw --limit 200 < /dev/null 2>/dev/null > "$LOGD/ofertas.json"
+ELEGIDA="$(python3 -I - "$LOGD/ofertas.json" "$EXMAQ" <<'EOF'
+import json, sys
+excl = set(sys.argv[2].split())
+d = [o for o in json.load(open(sys.argv[1])) if str(o.get("machine_id")) not in excl]
+# el más barato que cumple; a igual precio, más núcleos y más confiable
+d.sort(key=lambda o: (round(o["dph_total"], 3), -o.get("cpu_cores_effective", 0), -o["reliability"]))
+keys = ["id", "machine_id", "gpu_name", "num_gpus", "cpu_name", "cpu_cores_effective", "cpu_ram", "disk_bw", "reliability",
+        "dph_total", "inet_up", "inet_down", "inet_up_cost", "inet_down_cost", "driver_version", "cuda_max_good", "geolocation"]
+if not d: sys.exit(1)
+for o in d[:3]:
+    print(o["id"], round(o["dph_total"], 4), json.dumps({k: o.get(k) for k in keys}, ensure_ascii=False), sep="\t")
+EOF
+)" || { echo "ninguna oferta cumple el perfil con dph <= $MAX_DPH"; exit 1; }
+marca busqueda_fin
+DPH_MAX="$(cut -f2 <<< "$ELEGIDA" | sort -g | tail -1)"
+echo "candidatas:"; cut -f3 <<< "$ELEGIDA" | sed 's/^/  /'
+PEOR="$(py "print(round($DPH_MAX*($TTL+$RESPALDO_MIN)/60 + 0.02, 4))")"
+echo "peor caso de la corrida USD $PEOR (USD $DPH_MAX/h × $((TTL + RESPALDO_MIN)) min + tráfico) · tope USD $TOPE"
+py "import sys; sys.exit(0 if $PEOR <= $TOPE else 1)" || { echo "NO SE CORRE: el peor caso supera tope_usd; bajá ttl_min o --max-dph"; exit 1; }
+[ "$SOLO_BUSCAR" = 1 ] && { echo "solo búsqueda: no se alquila nada"; exit 0; }
+
+# ── temporizador en este host, ANTES del alta (sobrevive a este proceso, no a una caída del host) ────────────────────
+systemd-run --user --quiet --unit "$ETQ-ttl" --on-active="$((TTL + RESPALDO_MIN))m" --timer-property=AccuracySec=1s \
+  --description "vast-run: destruir $ETQ" "$YO" --destruir "$ETQ"
+T_ARM="$(date +%s)"
+
+IID=""; OFERTA_JSON="{}"; RC_CMD=""; ESTADO_FIN="fallo"; C1=""; T_ALTA=""; T_BAJA=""
+cierre() {
+  local rc=$? d
+  set +e
+  trap - INT TERM HUP
+  echo "[$(ts)] cierre (rc=$rc): destruyo"
+  marca baja_pedida
+  destruir "$ETQ"; d=$?
+  marca baja
+  T_BAJA="$(date +%s)"
+  if [ "$d" = 0 ]; then systemctl --user stop "$ETQ-ttl.timer" 2> /dev/null; echo "máquina destruida; temporizador cancelado"
+  else echo "ATENCIÓN: la baja no se confirmó; el temporizador y el guardián de la máquina siguen armados"; fi
+  C1="$(credito)"; echo "crédito después USD $C1"
+  [ "$rc" = 0 ] && ESTADO_FIN=ok
+  python3 -I - "$TIEMPOS" "$CARPETA/informe.json" <<EOF
+import json, sys
+t = {}
+for l in open(sys.argv[1]):
+    k, v = l.rstrip("\n").split("\t"); t.setdefault(k, float(v))
+def fase(a, b): return round(t[b] - t[a], 1) if a in t and b in t else None
+dph = float("${DPH:-0}" or 0)
+vida = fase("alta", "baja")
+inf = {
+  "etiqueta": "$ETQ", "estado": "$ESTADO_FIN", "rc": $rc, "rc_comando": ${RC_CMD:-None}, "datos": "$DATOS",
+  "oferta": json.loads(r'''$OFERTA_JSON'''), "instancia": "${IID}" or None,
+  "fases_s": {"busqueda": fase("busqueda_inicio", "busqueda_fin"), "arranque": fase("alta_pedida", "ssh_ok"),
+              "guardian": fase("ssh_ok", "guardian_ok"), "subida": fase("subida_inicio", "subida_fin"),
+              "comando": fase("comando_inicio", "comando_fin"), "bajada": fase("bajada_inicio", "bajada_fin"),
+              "baja": fase("baja_pedida", "baja"), "total": fase("inicio", "baja")},
+  "maquina_viva_s": vida,
+  "costo_usd": {"estimado_por_tiempo": round(dph * (vida or 0) / 3600, 4),
+                "por_credito": round(float("$C0") - float("${C1:-$C0}" or "$C0"), 4)},
+  "credito_usd": {"antes": float("$C0"), "despues": float("${C1:-$C0}" or "$C0")},
+  "nota": "el crédito de Vast se descuenta con retraso: el costo por crédito puede subir minutos después",
+}
+json.dump(inf, open(sys.argv[2], "w"), indent=1, ensure_ascii=False); print(json.dumps(inf["fases_s"]))
+EOF
+  echo "informe: $CARPETA/informe.json"
+  exit "$rc"
+}
+trap cierre EXIT
+trap 'echo "señal recibida"; exit 130' INT TERM HUP
+
+# ── alta, con el guardián dentro de la máquina ───────────────────────────────────────────────────────────────────────
+# Corre por onstart apenas arranca el contenedor: espera ttl_min y se destruye con la clave por instancia de Vast. Si
+# Vast no acepta el borrado, apaga el contenedor (kill 1) para que al menos deje de correr la GPU.
+GUARDIAN="$(base64 -w0 <<'EOF'
+#!/bin/bash
+L=/root/vast-run-guardian.log
+echo "$(date -Is) armado hasta=$1 ($(( $1 - $(date +%s) ))s) id=${CONTAINER_ID:-FALTA} clave=$([ -n "${CONTAINER_API_KEY:-}" ] && echo si || echo FALTA)" >> $L
+r=$(( $1 - $(date +%s) )); [ "$r" -gt 60 ] || r=60   # plazo absoluto: el arranque lento no lo estira
+sleep "$r"
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  c=$(curl -s -m 30 -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer ${CONTAINER_API_KEY:-}" \
+      "https://console.vast.ai/api/v0/instances/${CONTAINER_ID:-0}/")
+  echo "$(date -Is) borrado http $c (intento $i)" >> $L
+  sleep 30
+done
+kill -TERM 1
+EOF
+)"
+PLAZO=$(( T_ARM + TTL * 60 ))   # hora (epoch) en que la máquina se destruye sola
+ONSTART="echo $GUARDIAN | base64 -d > /root/vast-run-guardian.sh; nohup bash /root/vast-run-guardian.sh $PLAZO > /dev/null 2>&1 &"
+while IFS=$'\t' read -r OID DPH OJ; do
+  marca alta_pedida
+  R="$("$VK" create instance "$OID" --image "$IMAGEN" --disk "$DISCO" --label "$ETQ" --ssh --direct --cancel-unavail \
+        --env '-e NVIDIA_DRIVER_CAPABILITIES=all -e NVIDIA_DISABLE_REQUIRE=1' --onstart-cmd "$ONSTART" --raw < /dev/null 2>&1 || true)"
+  IID="$(printf '%s' "$R" | py 'import json,sys,re; m=re.search(r"\{.*\}", sys.stdin.read(), re.S); print(json.loads(m.group(0))["new_contract"])' 2>/dev/null || true)"
+  [ -n "$IID" ] && { OFERTA_JSON="$OJ"; break; }
+  echo "oferta $OID no disponible; pruebo la siguiente"
+done <<< "$ELEGIDA"
+[ -n "$IID" ] || { echo "no se pudo crear la máquina"; exit 1; }
+marca alta
+echo "máquina $IID (oferta $OID, USD $DPH/h)"
+
+# ── esperar SSH (15 minutos como máximo, 5 sin cambio de estado = colgada) ───────────────────────────────────────────
+KH="$LOGD/known_hosts"; : > "$KH"
+SSHO=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o UserKnownHostsFile="$KH" -o StrictHostKeyChecking=accept-new
+      -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o BatchMode=yes -o LogLevel=ERROR)
+ant=""; t_cambio=$(date +%s); t0=$(date +%s)
+while :; do
+  est="$(timeout 60 "$VK" show instance "$IID" --raw < /dev/null 2>/dev/null | py '
+import json,sys
+d=json.load(sys.stdin); d=d[0] if isinstance(d,list) else d
+print(d.get("actual_status"), (d.get("status_msg") or "").replace("\n"," ")[:120], sep="|")' || true)"
+  case "$est" in running*) break;; exited*|offline*) echo "estado $est"; exit 1;; esac
+  [ "$est" != "$ant" ] && { t_cambio=$(date +%s); ant="$est"; echo "[$(ts)] estado: $est"; }
+  [ $(( $(date +%s) - t_cambio )) -ge 300 ] && { echo "COLGADA: 5 minutos sin cambio de estado"; exit 1; }
+  [ $(( $(date +%s) - t0 )) -ge 900 ] && { echo "no arrancó en 15 minutos"; exit 1; }
+  sleep 5
+done
+URL="$(timeout 60 "$VK" ssh-url "$IID" < /dev/null 2>/dev/null | tail -1)"; HP="${URL#ssh://}"; H="${HP%:*}"; PORT="${HP##*:}"
+r() { ssh "${SSHO[@]}" -p "$PORT" "$H" "$@"; }
+for i in $(seq 1 30); do timeout 30 ssh "${SSHO[@]}" -p "$PORT" "$H" true < /dev/null 2> /dev/null && break; sleep 3; done
+timeout 30 ssh "${SSHO[@]}" -p "$PORT" "$H" true < /dev/null
+marca ssh_ok
+
+# ── el guardián tiene que estar armado, con id y clave; si no, la máquina no se usa ──────────────────────────────────
+for i in $(seq 1 12); do
+  G="$(timeout 30 ssh "${SSHO[@]}" -p "$PORT" "$H" 'cat /root/vast-run-guardian.log 2>/dev/null; pgrep -f "[v]ast-run-guardian.sh" > /dev/null && echo VIVO' < /dev/null 2> /dev/null || true)"
+  [ -n "$G" ] && break; sleep 5
+done
+echo "guardián: $(head -1 <<< "$G")"
+grep -q 'clave=si' <<< "$G" && ! grep -q 'id=FALTA' <<< "$G" && grep -q VIVO <<< "$G" \
+  || { echo "el guardián de la máquina no quedó armado: no se usa esta máquina"; exit 1; }
+marca guardian_ok
+if [ "$GPU" != no ]; then
+  timeout 60 ssh "${SSHO[@]}" -p "$PORT" "$H" 'nvidia-smi -L' < /dev/null || { echo "el trabajo pide GPU y nvidia-smi no responde"; exit 1; }
+fi
+
+# ── subida comprimida ────────────────────────────────────────────────────────────────────────────────────────────────
+marca subida_inicio
+EXA=(--exclude=./informe.json); while IFS= read -r x; do [ -n "$x" ] && EXA+=(--exclude="./$x"); done <<< "$EXCLUIR"
+tar -C "$CARPETA" "${EXA[@]}" -czf - . \
+  | timeout 600 ssh "${SSHO[@]}" -p "$PORT" "$H" 'mkdir -p /root/trabajo && tar -C /root/trabajo -xzf - && du -sh /root/trabajo'
+timeout 60 ssh "${SSHO[@]}" -p "$PORT" "$H" 'cat > /root/vast-run-comando.sh' < "$LOGD/comando.sh"
+marca subida_fin
+
+# ── comando: con tiempo máximo hasta 3 minutos antes del guardián ────────────────────────────────────────────────────
+CMD_S=$(( PLAZO - $(date +%s) - 180 ))
+[ "$CMD_S" -gt 60 ] || { echo "no queda tiempo de vida para correr el comando"; exit 1; }
+echo "[$(ts)] comando (máximo ${CMD_S}s)"
+marca comando_inicio
+set +e
+timeout -k 20 $(( CMD_S + 30 )) ssh "${SSHO[@]}" -p "$PORT" "$H" \
+  "cd /root/trabajo && timeout -k 15 $CMD_S bash /root/vast-run-comando.sh < /dev/null 2>&1; echo VAST_RUN_RC=\$?" < /dev/null \
+  | tee "$LOGD/comando.log"
+set -e
+marca comando_fin
+RC_CMD="$(grep -o 'VAST_RUN_RC=[0-9]*' "$LOGD/comando.log" | tail -1 | cut -d= -f2 || true)"
+[ -n "$RC_CMD" ] || RC_CMD=255
+cp "$LOGD/comando.log" "$CARPETA/vast-run-comando.log"
+if [ "$RC_CMD" != 0 ]; then echo "el comando salió con $RC_CMD"; exit 4; fi
+
+# ── bajada comprimida ────────────────────────────────────────────────────────────────────────────────────────────────
+marca bajada_inicio
+mapfile -t SAL <<< "$SALIDAS"
+QS="$(printf '%q ' "${SAL[@]}")"
+timeout 600 ssh "${SSHO[@]}" -p "$PORT" "$H" "cd /root/trabajo && tar -czf - -- $QS" < /dev/null | tar -C "$CARPETA" -xzf -
+marca bajada_fin
+echo "salidas en $CARPETA: ${SAL[*]}"
