@@ -1,0 +1,101 @@
+name: build-image-cpu
+
+# La variante CPU (Dockerfile.cpu) se publica como tag aparte del mismo paquete, ghcr.io/futurials/render-vast. El tag
+# lleva las versiones y la huella del Dockerfile.cpu: el mismo Dockerfile se publica una sola vez y nunca se pisa, así que
+# el digest que se fija en vast-run (construido en el PR que cambió el Dockerfile) es el que queda. Si el tag ya existe,
+# el job no reconstruye: muestra el digest publicado. La imagen de WebGL (build-image.yml) no cambia.
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile.cpu
+      - .github/workflows/build-image-cpu.yml
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile.cpu
+      - .github/workflows/build-image-cpu.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-image-cpu
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/futurials/render-vast
+  # versiones legibles del tag: tienen que coincidir con el Dockerfile.cpu
+  VERSIONES: cpu-ffmpeg6.1.1-node24.22.0
+
+jobs:
+  build-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tag desde las versiones y la huella del Dockerfile.cpu
+        id: tag
+        run: |
+          for v in "NODE_VERSION=v24.22.0" "FFMPEG_VERSION=6.1.1"; do
+            grep -qx "ARG $v" Dockerfile.cpu || { echo "::error::el Dockerfile.cpu no tiene ARG $v; actualizá VERSIONES"; exit 1; }
+          done
+          echo "tag=$VERSIONES-$(sha256sum Dockerfile.cpu | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # un PR desde un fork no tiene permiso de escritura en el paquete: ahí sólo se construye
+      - id: publica
+        run: echo "si=${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}" >> "$GITHUB_OUTPUT"
+
+      - if: steps.publica.outputs.si == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ¿Ya está publicado?
+        id: existe
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$TAG" > /dev/null 2>&1; then
+            echo "si=true" >> "$GITHUB_OUTPUT"; echo "$IMAGE:$TAG ya existe: no se reconstruye"
+          else
+            echo "si=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: build
+        if: steps.existe.outputs.si != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.cpu
+          platforms: linux/amd64
+          push: ${{ steps.publica.outputs.si == 'true' }}
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Digest y tamaño
+        if: steps.publica.outputs.si == 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE:$TAG" --raw > manifest.json
+          digest="sha256:$(sha256sum manifest.json | cut -d' ' -f1)"
+          comp=$(jq '[.layers[].size] | add' manifest.json)
+          {
+            echo "### $IMAGE (CPU)"
+            echo
+            echo "- tag: \`$TAG\`"
+            echo "- digest: \`$digest\`"
+            echo "- tamaño comprimido: $comp bytes ($(( comp / 1048576 )) MiB)"
+            echo "- fijar como: \`$IMAGE@$digest\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
