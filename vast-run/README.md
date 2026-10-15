@@ -6,7 +6,7 @@ imágenes de este repo, siempre fijada por digest:
 
 | `perfil.gpu` | imagen | qué trae | arranque medido |
 |---|---|---|---|
-| `"no"` | CPU, `ghcr.io/futurials/render-vast@sha256:4c651b3c…ab9e` (197 MiB) | Ubuntu 24.04, ffmpeg 6.1.1 (libx264), Node 24, Python 3 con Pillow | ver abajo |
+| `"no"` | CPU, `ghcr.io/futurials/render-vast@sha256:7736e548…6a91` (197 MiB) | Ubuntu 24.04, ffmpeg 6.1.1 (libx264), Node 24, Python 3 con Pillow | ver abajo |
 | `"cualquiera"` o `"requerida"` | WebGL, `ghcr.io/futurials/render-vast@sha256:4e1a7ecc…8515` (575 MiB) | CUDA, ffmpeg 6.1.1 (con `h264_nvenc`), Node 24, Python 3 con Pillow, HyperFrames y Chrome Headless Shell | 409 s (MOT-019) |
 
 Un trabajo que necesita algo que sólo trae la de WebGL (Chrome, HyperFrames) sin GPU la pide con `"imagen"`.

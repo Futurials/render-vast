@@ -67,7 +67,7 @@ paquete con dependencias rotas a propósito, no hay que correr `apt-get install`
 | imagen | tag | digest |
 |---|---|---|
 | WebGL | `hf0.8.140-chrome152.0.7977.30-node24.21.0` | `sha256:4e1a7ecc11a82982acf6d9dab71184ddb96ae9d6e80ab35d5d820728a5498515` (575 MiB comprimidos) |
-| CPU | `cpu-ffmpeg6.1.1-node24.22.0-bf9f57af797b` | `sha256:4c651b3c3cff68c66d03b65744857d6f57be8749781426f8b84f9c8fdfedab9e` (197 MiB comprimidos) |
+| CPU | `cpu-ffmpeg6.1.1-node24.22.0-a9428aab0060` | `sha256:7736e548eb1269336bf8e5d43c109654fb8b995bbebefb570baf8b53041f6a91` (197 MiB comprimidos) |
 
 Usala siempre por digest (`ghcr.io/futurials/render-vast@sha256:…`), no por tag: el tag se reescribe si se reconstruye.
 
