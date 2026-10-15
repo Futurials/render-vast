@@ -8,6 +8,13 @@ que la preparación baje de varios minutos a lo que tarda en bajar la imagen.
 ghcr.io/futurials/render-vast
 ```
 
+## Despachar otros trabajos pesados: `vast-run/`
+
+[`vast-run/`](vast-run/README.md) usa esta misma imagen para correr cualquier trabajo pesado (codificar video, renderizar,
+procesar lotes) en una máquina de Vast.ai en vez de en el VPS: sube una carpeta con su `trabajo.json`, corre el comando,
+baja las salidas, deja un `informe.json` con tiempos y costo, y destruye la máquina siempre. Sólo acepta datos sintéticos
+o públicos.
+
 ## Qué trae
 
 | componente | versión | cómo se verifica en el build |
