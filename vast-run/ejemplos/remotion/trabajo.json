@@ -1,0 +1,14 @@
+{
+  "comando": "node /opt/remotion-runtime/humo.cjs .",
+  "salidas": ["salida/humo.mp4", "salida/tiempos.json"],
+  "perfil": {
+    "cpu_min": 32,
+    "ram_min_gb": 32,
+    "gpu": "no"
+  },
+  "imagen": "ghcr.io/futurials/render-vast@sha256:PENDIENTE",
+  "datos": "sinteticos",
+  "tope_usd": 0.20,
+  "ttl_min": 15,
+  "excluir_subida": ["salida"]
+}
