@@ -6,7 +6,7 @@
     "ram_min_gb": 32,
     "gpu": "no"
   },
-  "imagen": "ghcr.io/futurials/render-vast@sha256:PENDIENTE",
+  "imagen": "ghcr.io/futurials/render-vast@sha256:e2bd304442c72f9f4fff4bb4fe8e15961bd40b7c993619463cb4b570e84620f9",
   "datos": "sinteticos",
   "tope_usd": 0.20,
   "ttl_min": 15,

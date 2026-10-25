@@ -1,15 +1,39 @@
 # vast-run
 
 Despachador genérico de trabajos pesados (codificar video, renderizar, procesar lotes) a una máquina alquilada de
-Vast.ai. Sube una carpeta, corre un comando parado en ella, baja las salidas y destruye la máquina. Usa una de las dos
-imágenes de este repo, siempre fijada por digest:
+Vast.ai. Sube una carpeta, corre un comando parado en ella, baja las salidas y destruye la máquina. Usa por defecto una de
+dos imágenes de este repo, siempre fijada por digest; la tercera, la de Remotion, se pide con `"imagen"`:
 
 | `perfil.gpu` | imagen | qué trae | arranque medido |
 |---|---|---|---|
 | `"no"` | CPU, `ghcr.io/futurials/render-vast@sha256:7736e548…6a91` (197 MiB) | Ubuntu 24.04, ffmpeg 6.1.1 (libx264), Node 24, Python 3 con Pillow | 96 a 98 s en frío; 30 s si la máquina ya la tiene (MOT-020) |
 | `"cualquiera"` o `"requerida"` | WebGL, `ghcr.io/futurials/render-vast@sha256:4e1a7ecc…8515` (575 MiB) | CUDA, ffmpeg 6.1.1 (con `h264_nvenc`), Node 24, Python 3 con Pillow, HyperFrames y Chrome Headless Shell | 409 s con GPU, 131 s sin GPU (MOT-019) |
+| `"no"` con `"imagen"` | Remotion, `ghcr.io/futurials/render-vast@sha256:e2bd304442c72f9f4fff4bb4fe8e15961bd40b7c993619463cb4b570e84620f9` (449 MiB) | lo de la de CPU, más Remotion 4.0.538 (`remotion`, `@remotion/renderer`, `@remotion/bundler`, `@remotion/cli`) en `/opt/remotion-runtime`, su Chrome Headless Shell 157.0.8080.0, Python 3 con numpy y Pillow, y `uv` | 97 a 109 s en frío; 37 s si la máquina ya la tiene (MOT-008) |
 
 Un trabajo que necesita algo que sólo trae la de WebGL (Chrome, HyperFrames) sin GPU la pide con `"imagen"`.
+
+### Remotion
+
+La imagen Remotion no es la de ningún valor por defecto: se pide en el `trabajo.json` con
+`"imagen": "ghcr.io/futurials/render-vast@sha256:e2bd304442c72f9f4fff4bb4fe8e15961bd40b7c993619463cb4b570e84620f9"`.
+Renderiza un bundle de Remotion ya construido sin bajar nada al arrancar. El ejemplo está en
+[`ejemplos/remotion/`](ejemplos/remotion/): el bundle de la prueba de humo de la imagen
+([`remotion/humo.cjs`](../remotion/humo.cjs)) y su `trabajo.json` (32 núcleos, 32 GB, sin GPU).
+
+Para un script propio dentro de la máquina:
+
+- Pasale a `selectComposition` y a `renderMedia` `browserExecutable: process.env.REMOTION_BROWSER_EXECUTABLE`. Sin eso,
+  Remotion busca Chrome según la carpeta actual (`/root/trabajo`), no lo encuentra y lo baja de nuevo.
+- Escribilo en CommonJS (`.cjs`, `require`): `require` encuentra Remotion en `/opt/remotion-runtime/node_modules` por
+  `NODE_PATH`, `import` no. Con ESM, `createRequire(process.env.REMOTION_RUNTIME + "/")`.
+- Subí el bundle tal como lo deja `bundle()`, con sus `.map`: `renderMedia` lee `bundle.js.map` y falla si no está.
+- Construí el bundle con Remotion 4.0.538, la misma versión de la imagen: Remotion no garantiza que un bundle de otra
+  versión renderice igual.
+
+Medido con el ejemplo (MOT-008): 30 cuadros a 1080×1920 en 2,1 s en un Threadripper PRO 3995WX de 32 núcleos efectivos,
+71,7 s de corrida entera con la máquina ya caliente y USD 0,005. Ojo con el host `217.171.200.22` (Noruega, máquinas 14517,
+17720 y 150667): Vast las da por arrancadas, pero el puerto SSH directo no responde, y `vast-run` termina destruyéndolas
+sin correr nada. Con `perfil.excluir_maquinas` se evitan.
 
 Del arranque en frío de la de CPU, unos 60 s no son la imagen: Vast arma una capa encima que instala su SSH con
 `apt-get` (por eso la imagen deja apt consistente; ver el README de la raíz).
