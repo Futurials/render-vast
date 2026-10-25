@@ -1,0 +1,93 @@
+# render-vast, variante Remotion · imagen sin GPU para que vast-run renderice bundles de Remotion ya construidos (los
+# reels y carruseles de motion-local) en una máquina con muchos núcleos, sin instalar nada al arrancar. Parte de la de
+# CPU (Dockerfile.cpu): la misma base, el mismo ffmpeg y el mismo Node. Se publica como tag aparte del mismo paquete
+# (ghcr.io/futurials/render-vast:remotion-…); ver build-image-remotion.yml. El build falla si una huella no coincide.
+
+# Ubuntu 24.04, fijada por digest del índice multiplataforma: la misma que la de CPU y que el VPS (ffmpeg 6.1.1 de apt)
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+
+ARG NODE_VERSION=v24.22.0
+ARG NODE_SHA256=cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008
+ARG FFMPEG_VERSION=6.1.1
+ARG REMOTION_VERSION=4.0.538
+ARG REACT_VERSION=19.3.1
+# el árbol npm se resuelve como estaba publicado en esta fecha: así sale idéntico al lock con el que se validó
+ARG NPM_BEFORE=2026-10-24T23:15:00Z
+# sha256 de las líneas "ruta versión integridad" del package-lock, ordenadas (299 paquetes)
+ARG NPM_TREE_SHA256=d1a33388f3167ebb1fa84441f75c529d7c0d6f46e7ae1d4eb025c136b5f9f4fd
+# el Chrome Headless Shell que trae esta versión de Remotion (el parcheado de remotion.media); sha256 del binario
+ARG CHROME_VERSION=157.0.8080.0
+ARG CHROME_SHA256=6499ae333be19f27484c73a61da262754a02ab3d82bbba856f44bef785ec3e62
+ARG UV_VERSION=0.13.5
+# sha256 de la rueda uv-0.13.5-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl de PyPI
+ARG UV_SHA256=fa8d26e08e34c29c0c4e820cf3181757086d547240b4f4d31ff1d8bd810ca946
+
+LABEL org.opencontainers.image.source="https://github.com/Futurials/render-vast" \
+      org.opencontainers.image.description="Ubuntu 24.04 + ffmpeg, Node, Remotion con su Chrome Headless Shell y Python 3 con numpy para render por CPU en Vast.ai" \
+      org.opencontainers.image.licenses="NOASSERTION"
+
+# Remotion no tiene telemetría propia: sólo manda un evento de uso cuando renderMedia recibe licenseKey, y la imagen no
+# trae ninguna. Se apagan las de npm y uv, y DO_NOT_TRACK para lo demás.
+ENV DEBIAN_FRONTEND=noninteractive CI=true NO_COLOR=1 TERM=dumb DO_NOT_TRACK=1 \
+    npm_config_progress=false npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false \
+    UV_NO_PROGRESS=1 \
+    REMOTION_VERSION=${REMOTION_VERSION} \
+    REMOTION_RUNTIME=/opt/remotion-runtime \
+    NODE_PATH=/opt/remotion-runtime/node_modules \
+    REMOTION_BROWSER_EXECUTABLE=/opt/remotion-runtime/node_modules/.remotion/chrome-headless-shell/linux64/chrome-headless-shell-linux64/chrome-headless-shell
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+# paquetes del sistema: ffmpeg y Python 3 con numpy y Pillow para el master y el QA de motion-local; curl, procps y tar
+# para vast-run; las bibliotecas que Remotion pide para Chrome Headless Shell en Ubuntu 24.04
+# (remotion.dev/docs/miscellaneous/linux-dependencies) y fonts-liberation para que haya una fuente de sistema.
+# A diferencia de la de CPU, Mesa queda entero: libgbm lo usa y apt queda consistente sin tocar nada (Vast corre
+# apt-get encima de la imagen al arrancar, para instalar su SSH).
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends ca-certificates curl xz-utils procps time ffmpeg \
+    python3 python3-numpy python3-pil python3-pip fonts-liberation \
+    libnss3 libdbus-1-3 libatk1.0-0 libasound2t64 libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 libxdamage1 \
+    libgbm-dev libcups2 libcairo2 libpango-1.0-0 libatk-bridge2.0-0 \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
+ && apt-get check \
+ && v="$(ffmpeg -version | sed -n 1p)" && echo "${v}" && [[ "${v}" == "ffmpeg version ${FFMPEG_VERSION}-"* ]] \
+ && python3 -c 'import numpy, PIL; print("numpy", numpy.__version__, "pillow", PIL.__version__)' \
+ && tar --version | sed -n 1p && curl --version | sed -n 1p
+
+# uv desde PyPI, por pip y con el hash de la rueda (sin curl | sh)
+RUN echo "uv==${UV_VERSION} --hash=sha256:${UV_SHA256}" > /tmp/uv.txt \
+ && python3 -m pip install -q --no-cache-dir --break-system-packages --require-hashes -r /tmp/uv.txt \
+ && rm /tmp/uv.txt \
+ && v="$(uv --version)" && echo "${v}" && [[ "${v}" == "uv ${UV_VERSION}"* ]]
+
+# Node, tarball oficial; sólo el binario y npm (sin headers ni documentación)
+RUN cd /opt \
+ && curl -fsS -o node.tar.xz "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz" \
+ && echo "${NODE_SHA256}  node.tar.xz" | sha256sum -c - \
+ && tar xf node.tar.xz && rm node.tar.xz \
+ && rm -rf "/opt/node-${NODE_VERSION}-linux-x64/include" "/opt/node-${NODE_VERSION}-linux-x64/share" \
+ && ln -sf "/opt/node-${NODE_VERSION}-linux-x64/bin/"* /usr/local/bin/ \
+ && [ "$(node -v)" = "${NODE_VERSION}" ] && npm -v
+
+# runtime de Remotion, versiones exactas, con su package-lock en /opt/remotion-runtime; después el Chrome Headless Shell
+# de esa versión, bajado ahora con `remotion browser ensure` para que la máquina no baje nada al arrancar
+RUN mkdir -p "${REMOTION_RUNTIME}" && cd "${REMOTION_RUNTIME}" \
+ && printf '{"name":"remotion-runtime","private":true,"dependencies":{"remotion":"%s","@remotion/renderer":"%s","@remotion/bundler":"%s","@remotion/cli":"%s","react":"%s","react-dom":"%s"}}\n' \
+      "${REMOTION_VERSION}" "${REMOTION_VERSION}" "${REMOTION_VERSION}" "${REMOTION_VERSION}" "${REACT_VERSION}" "${REACT_VERSION}" \
+      > package.json \
+ && npm install --before="${NPM_BEFORE}" --no-audit --no-fund --no-progress --loglevel=error \
+ && got="$(node -e 'const p=require(process.argv[1]).packages;process.stdout.write(Object.keys(p).filter(k=>k).sort().map(k=>k+" "+p[k].version+" "+p[k].integrity).join("\n")+"\n")' "${REMOTION_RUNTIME}/package-lock.json" | sha256sum | cut -d' ' -f1)" \
+ && echo "árbol npm ${got}" && [ "${got}" = "${NPM_TREE_SHA256}" ] \
+ && npm cache clean --force \
+ && npx --no-install remotion browser ensure < /dev/null 2>&1 | grep -v '^Getting' \
+ && echo "${CHROME_SHA256}  ${REMOTION_BROWSER_EXECUTABLE}" | sha256sum -c - \
+ && missing="$(ldd "${REMOTION_BROWSER_EXECUTABLE}" | grep 'not found' || true)" && [ -z "${missing}" ] \
+ && "${REMOTION_BROWSER_EXECUTABLE}" --version 2>/dev/null | grep -F "${CHROME_VERSION}"
+
+# prueba de humo, sin red: empaqueta una composición de 30 cuadros a 1080×1920, la renderiza con renderMedia desde otra
+# carpeta y comprueba los cuadros y las versiones. Sin red, si Remotion quisiera bajar algo al renderizar, falla acá.
+COPY remotion/humo.cjs /opt/remotion-runtime/humo.cjs
+RUN --network=none cd /tmp && node /opt/remotion-runtime/humo.cjs /tmp/humo \
+ && cat /tmp/humo/salida/tiempos.json && rm -rf /tmp/humo /tmp/remotion-* /root/.cache
+
+WORKDIR /root
