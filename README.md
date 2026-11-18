@@ -14,7 +14,7 @@ El mismo paquete tiene tres imágenes, con tags separados:
 |---|---|---|---|
 | WebGL (tags `hf…-chrome…-node…`) | render de HyperFrames con GPU (motion, `launch-video`) y trabajos de `vast-run` con GPU | [`Dockerfile`](Dockerfile) | 575 MiB |
 | CPU (tags `cpu-…`) | trabajos de `vast-run` sin GPU: codificar video con libx264, procesar lotes | [`Dockerfile.cpu`](Dockerfile.cpu) | 197 MiB |
-| Remotion (tags `remotion-…`) | render por CPU de bundles de Remotion ya construidos (`motion-local`) con `vast-run`; se pide con `"imagen"`, ver [`vast-run/`](vast-run/README.md#remotion) · vigente `remotion-4.0.538-node24.22.0-20a8e8a32a79`, `sha256:e2bd304442c72f9f4fff4bb4fe8e15961bd40b7c993619463cb4b570e84620f9` | [`Dockerfile.remotion`](Dockerfile.remotion) | 449 MiB |
+| Remotion (tags `remotion-…`) | render por CPU de bundles de Remotion ya construidos (`motion-local`) con `vast-run`; se pide con `"imagen"`, ver [`vast-run/`](vast-run/README.md#remotion) · vigente `remotion-4.0.538-node24.22.0-99c18bf3d029`, `sha256:102fe55f06d2484ce4ac63db8ed9641e12a47357bb33c35489bbe2cdae1f0421` | [`Dockerfile.remotion`](Dockerfile.remotion) | 449 MiB |
 
 La de CPU existe porque el arranque de la máquina se comía la ganancia de codificar en Vast: la de WebGL baja CUDA,
 Chrome y HyperFrames que un trabajo de ffmpeg no usa (MOT-019: 131 s de arranque en CPU, 409 s en GPU).

@@ -8,14 +8,14 @@ dos imágenes de este repo, siempre fijada por digest; la tercera, la de Remotio
 |---|---|---|---|
 | `"no"` | CPU, `ghcr.io/futurials/render-vast@sha256:7736e548…6a91` (197 MiB) | Ubuntu 24.04, ffmpeg 6.1.1 (libx264), Node 24, Python 3 con Pillow | 96 a 98 s en frío; 30 s si la máquina ya la tiene (MOT-020) |
 | `"cualquiera"` o `"requerida"` | WebGL, `ghcr.io/futurials/render-vast@sha256:4e1a7ecc…8515` (575 MiB) | CUDA, ffmpeg 6.1.1 (con `h264_nvenc`), Node 24, Python 3 con Pillow, HyperFrames y Chrome Headless Shell | 409 s con GPU, 131 s sin GPU (MOT-019) |
-| `"no"` con `"imagen"` | Remotion, `ghcr.io/futurials/render-vast@sha256:e2bd304442c72f9f4fff4bb4fe8e15961bd40b7c993619463cb4b570e84620f9` (449 MiB) | lo de la de CPU, más Remotion 4.0.538 (`remotion`, `@remotion/renderer`, `@remotion/bundler`, `@remotion/cli`) en `/opt/remotion-runtime`, su Chrome Headless Shell 157.0.8080.0, Python 3 con numpy y Pillow, y `uv` | 97 a 109 s en frío; 37 s si la máquina ya la tiene (MOT-008) |
+| `"no"` con `"imagen"` | Remotion, `ghcr.io/futurials/render-vast@sha256:102fe55f06d2484ce4ac63db8ed9641e12a47357bb33c35489bbe2cdae1f0421` (449 MiB) | lo de la de CPU, más Remotion 4.0.538 (`remotion`, `@remotion/renderer`, `@remotion/bundler`, `@remotion/cli`) en `/opt/remotion-runtime`, su Chrome Headless Shell 157.0.8080.0, Python 3 con numpy y Pillow, `uv` y `libatomic1` (la pide `pedalboard`) | 97 a 109 s en frío; 37 s si la máquina ya la tiene (MOT-008) |
 
 Un trabajo que necesita algo que sólo trae la de WebGL (Chrome, HyperFrames) sin GPU la pide con `"imagen"`.
 
 ### Remotion
 
 La imagen Remotion no es la de ningún valor por defecto: se pide en el `trabajo.json` con
-`"imagen": "ghcr.io/futurials/render-vast@sha256:e2bd304442c72f9f4fff4bb4fe8e15961bd40b7c993619463cb4b570e84620f9"`.
+`"imagen": "ghcr.io/futurials/render-vast@sha256:102fe55f06d2484ce4ac63db8ed9641e12a47357bb33c35489bbe2cdae1f0421"`.
 Renderiza un bundle de Remotion ya construido sin bajar nada al arrancar. El ejemplo está en
 [`ejemplos/remotion/`](ejemplos/remotion/): el bundle de la prueba de humo de la imagen
 ([`remotion/humo.cjs`](../remotion/humo.cjs)) y su `trabajo.json` (32 núcleos, 32 GB, sin GPU).
